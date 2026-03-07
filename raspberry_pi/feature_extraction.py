@@ -68,7 +68,7 @@ def compute_features(packets, flow_key):
     
     lengths = [p["length"] for p in packets]
 
-    
+
     timestamps = [p["timestamp"] for p in packets]
 
     #FLOW DURATION
