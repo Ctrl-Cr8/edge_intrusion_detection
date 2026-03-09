@@ -1,1 +1,35 @@
-[]
+[
+  {
+    "timestamp": "2026-03-09T20:56:14.942715",
+    "src_ip": "192.168.1.42",
+    "dst_ip": "192.168.1.1",
+    "attack_type": "DDoS",
+    "anomaly_score": 78.5,
+    "received_at": "2026-03-09 20:56:14",
+    "protocol": 6,
+    "label": "DDoS",
+    "block_status": "permanent"
+  },
+  {
+    "timestamp": "2026-03-09T20:56:29.184770",
+    "src_ip": "192.168.1.42",
+    "dst_ip": "192.168.1.1",
+    "attack_type": "DDoS",
+    "anomaly_score": 78.5,
+    "received_at": "2026-03-09 20:56:29",
+    "protocol": 6,
+    "label": "DDoS",
+    "block_status": "permanent"
+  },
+  {
+    "timestamp": "2026-03-09T20:56:55.929506",
+    "src_ip": "192.168.1.44",
+    "dst_ip": "192.168.1.1",
+    "attack_type": "DDoS",
+    "anomaly_score": 78.5,
+    "received_at": "2026-03-09 20:56:55",
+    "protocol": 6,
+    "label": "DDoS",
+    "block_status": "permanent"
+  }
+]
