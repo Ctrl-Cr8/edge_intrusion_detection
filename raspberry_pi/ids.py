@@ -3,66 +3,120 @@ import numpy as np
 import requests
 import time
 from datetime import datetime
-import feature_extraction
-
-LAPTOP_URL = ""
-
-layer1 = joblib.load("final_model_1.pkl")
-layer2 = joblib.load("ml_layer2.pkl")
-
-# ─── Feature Names for Layer 2 ────────────────────────────────────────────────
 import pandas as pd
+import feature_extraction
+from blocker import block_ip, unblock_ip
+
+LAPTOP_URL   = "http://192.168.43.105:5000/alert"
+COMMANDS_URL = "http://192.168.43.105:5000/commands"
+
+layer1 = joblib.load("/home/pi/final_model_2.pkl")
+layer2 = joblib.load("/home/pi/ml_model1.pkl")
+
 feature_names = [
-    'Protocol', 'Flow Duration', 'Flow Bytes/s', 'Flow Packets/s',
-    'Packet Length Mean', 'Flow IAT Mean', 'Flow IAT Std',
-    'SYN Flag Count', 'ACK Flag Count', 'RST Flag Count'
+    'Flow Duration',
+    'Flow IAT Mean',
+    'Flow IAT Std',
+    'Packet Length Variance',
+    'Packet Length Max',
+    'Init Fwd Win Bytes',
+    'Init Bwd Win Bytes',
+    'Fwd Packets/s',
+    'Bwd Packet Length Mean',
+    'Packet Length Min'
 ]
 
+def do_block(ip, anomaly_score):
+    if anomaly_score >= 70:
+        block_ip(ip, permanent=True, anomaly_score=anomaly_score)
+    else:
+        block_ip(ip, permanent=False, anomaly_score=anomaly_score)
+
+def poll_commands():
+    """Poll laptop server for pending commands every 2 seconds."""
+    while True:
+        try:
+            response = requests.get(COMMANDS_URL, timeout=3)
+            if response.status_code == 200:
+                commands = response.json().get("commands", [])
+                for cmd in commands:
+                    action = cmd.get("action")
+                    ip     = cmd.get("ip")
+
+                    if not ip:
+                        continue
+
+                    if action == "unblock":
+                        unblock_ip(ip)
+                        print(f"[COMMANDS] Unblocked {ip} via dashboard")
+                        try:
+                            requests.post(
+                                COMMANDS_URL.replace("/commands", "/confirm"),
+                                json={"ip": ip, "status": "success", "action": "unblock"},
+                                timeout=3
+                            )
+                        except requests.exceptions.RequestException:
+                            pass
+
+        except requests.exceptions.RequestException as e:
+            print(f"[COMMANDS] Could not reach laptop: {e}")
+
+        time.sleep(2)
+
 def main():
+    import threading
+    poll_thread = threading.Thread(target=poll_commands, daemon=True)
+    poll_thread.start()
+    print("[IDS] Command polling started")
+
     while True:
         flows = feature_extraction.extract_features()
-
         for meta, features in flows:
-
-
-            prediction = layer1.predict([features])[0]
+            prediction    = layer1.predict([features])[0]
+            raw_score     = layer1.decision_function([features])[0]
+            anomaly_score = round(float(max(0.0, min(100.0, (-raw_score) * 200))), 1)
 
             if prediction == -1:
-
                 df = pd.DataFrame([features], columns=feature_names)
-                attack_type = layer2.predict(df)[0]
+                attack_type  = layer2.predict(df)[0]
+                block_status = "permanent" if anomaly_score >= 70 else "timeout"
+
+                do_block(meta["src_ip"], anomaly_score)
 
                 alert = {
-                    "timestamp": datetime.now().isoformat(),
-                    "src_ip": meta["src_ip"],
-                    "dst_ip": meta["dst_ip"],
-                    "protocol": meta["protocol"],
+                    "timestamp":     datetime.now().isoformat(),
+                    "src_ip":        meta["src_ip"],
+                    "dst_ip":        meta["dst_ip"],
+                    "protocol":      meta["protocol"],
+                    "anomaly_score": anomaly_score,
+                    "block_status":  block_status,
+                    "label":         attack_type,
                     "features": {
-                        "Protocol":           float(features[0]),
-                        "Flow Duration":      float(features[1]),
-                        "Flow Bytes/s":       float(features[2]),
-                        "Flow Packets/s":     float(features[3]),
-                        "Packet Length Mean": float(features[4]),
-                        "Flow IAT Mean":      float(features[5]),
-                        "Flow IAT Std":       float(features[6]),
-                        "SYN Flag Count":     float(features[7]),
-                        "ACK Flag Count":     float(features[8]),
-                        "RST Flag Count":     float(features[9]),
-                    },
-                    "label": attack_type
+                        "Flow Duration":          float(features[0]),
+                        "Flow IAT Mean":          float(features[1]),
+                        "Flow IAT Std":           float(features[2]),
+                        "Packet Length Variance": float(features[3]),
+                        "Packet Length Max":      float(features[4]),
+                        "Init Fwd Win Bytes":     float(features[5]),
+                        "Init Bwd Win Bytes":     float(features[6]),
+                        "Fwd Packets/s":          float(features[7]),
+                        "Bwd Packet Length Mean": float(features[8]),
+                        "Packet Length Min":      float(features[9]),
+                    }
                 }
 
-                print(f"ANOMALY! [{attack_type}]\n")
+                print(f"[IDS] ANOMALY! [{attack_type}] score={anomaly_score} → {block_status} block on {meta['src_ip']}")
 
                 try:
                     requests.post(LAPTOP_URL, json=alert, timeout=3)
                 except requests.exceptions.RequestException as e:
-                    print(f"Failed to send alert: {e}")
+                    print(f"[IDS] Failed to send alert: {e}")
 
             else:
-                print(f"Normal Traffic")
+                print(f"[IDS] Normal traffic from {meta['src_ip']}")
 
         time.sleep(1)
 
 if __name__ == "__main__":
+    feature_extraction.start_sniffing()
     main()

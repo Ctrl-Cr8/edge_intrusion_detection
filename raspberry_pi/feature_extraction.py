@@ -1,148 +1,172 @@
 import numpy as np
-from scapy.all import sniff, IP, TCP
+import dpkt
+import pcapy
 import threading
 import time
 from collections import defaultdict
 
-flows = {}
-completed_flows = []
-lock = threading.Lock()
 
-PACKET_THRESHOLD = 10  # extract features every 10 packets
-INTERFACE = "eth0"
+INTERFACE        = "eth0"
+PACKET_THRESHOLD = 10       # compute features every N packets per flow
+SNAPLEN          = 128      # bytes captured per packet (headers only)
+PROMISC          = True
+TIMEOUT_MS       = 100
+BPF_FILTER       = "tcp or udp or icmp"
 
-def process_packet(pkt):
-    if not pkt.haslayer(IP):
+flows           = {}        
+completed_flows = []        
+lock            = threading.Lock()
+
+
+# ─── Packet handler ───────────────────────────────────────────────────────────
+def process_packet(hdr, buf):
+    
+    try:
+        eth = dpkt.ethernet.Ethernet(buf)
+    except Exception:
         return
 
-    ip = pkt[IP]
-    src_ip = ip.src
-    dst_ip = ip.dst
-    
-    
-    protocol = ip.proto  #PROTOCOL
+    if not isinstance(eth.data, dpkt.ip.IP):
+        return
 
-    #PACKET SIZE
-    length = len(pkt)
+    ip       = eth.data
+    protocol = ip.p                     # 6=TCP, 17=UDP, 1=ICMP
+    src_ip   = dpkt.socket.inet_ntoa(ip.src)
+    dst_ip   = dpkt.socket.inet_ntoa(ip.dst)
 
-    
+    # Use original wire length, NOT len(buf), for accurate byte counts
+    length    = hdr.getlen()
     timestamp = time.time()
 
-
-
+    # ── TCP flags & window size ───────────────────────────────────────────────
     syn = ack = rst = 0
-    if pkt.haslayer(TCP):
+    tcp_window = 0
 
-        flags = pkt[TCP].flags
-        syn = 1 if flags & 0x02 else 0
-        ack = 1 if flags & 0x10 else 0
-        rst = 1 if flags & 0x04 else 0
+    if isinstance(ip.data, dpkt.tcp.TCP):
+        tcp   = ip.data
+        flags = tcp.flags
+        syn   = 1 if (flags & dpkt.tcp.TH_SYN) else 0
+        ack   = 1 if (flags & dpkt.tcp.TH_ACK) else 0
+        rst   = 1 if (flags & dpkt.tcp.TH_RST) else 0
+        tcp_window = tcp.win                # TCP receive window (bytes)
 
-    
     packet_info = {
-        "timestamp": timestamp,
-        "length": length,
-        "syn": syn,
-        "ack": ack,
-        "rst": rst,
+        "timestamp":  timestamp,
+        "length":     length,
+        "syn":        syn,
+        "ack":        ack,
+        "rst":        rst,
+        "tcp_window": tcp_window,
+        "src_ip":     src_ip,   # kept per-packet to determine Fwd/Bwd
     }
 
     flow_key = (src_ip, dst_ip, protocol)
 
     with lock:
-        
         if flow_key not in flows:
             flows[flow_key] = []
+
         flows[flow_key].append(packet_info)
 
-        #CHECK IF 10 PACKETS HAVE ARRIVED
         if len(flows[flow_key]) >= PACKET_THRESHOLD:
-
             flow_packets = flows.pop(flow_key)
             features, meta = compute_features(flow_packets, flow_key)
-
             completed_flows.append((meta, features))
 
+
+# ─── Feature computation ──────────────────────────────────────────────────────
 def compute_features(packets, flow_key):
+    """
+    Extracts the 10 features the ML model was trained on:
+
+        Flow Duration, Flow IAT Mean, Flow IAT Std,
+        Packet Length Variance, Packet Length Max,
+        Init Fwd Win Bytes, Init Bwd Win Bytes,
+        Fwd Packets/s, Bwd Packet Length Mean, Packet Length Min
+
+    Direction convention (matches CICIDS2017):
+        Fwd = packets whose src_ip matches the FIRST packet's src_ip
+        Bwd = all other packets
+    """
     src_ip, dst_ip, protocol = flow_key
-    
-    lengths = [p["length"] for p in packets]
 
+    # Fwd direction = same src_ip as the first packet seen in this flow
+    fwd_src = packets[0]["src_ip"]
 
+    lengths    = [p["length"]    for p in packets]
     timestamps = [p["timestamp"] for p in packets]
 
-    #FLOW DURATION
+    fwd_packets = [p for p in packets if p["src_ip"] == fwd_src]
+    bwd_packets = [p for p in packets if p["src_ip"] != fwd_src]
+
+    # ── Flow Duration ─────────────────────────────────────────────────────────
     flow_duration = timestamps[-1] - timestamps[0]
     if flow_duration == 0:
-        flow_duration = 1e-6  
-    
+        flow_duration = 1e-6
 
+    # ── Flow IAT Mean / Std ───────────────────────────────────────────────────
+    iats = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps) - 1)]
+    flow_iat_mean = float(np.mean(iats)) if iats else 0.0
+    flow_iat_std  = float(np.std(iats))  if iats else 0.0
 
-    #FLOW BYTES /S
-    total_bytes = sum(lengths)
-    flow_bytes_per_s = total_bytes / flow_duration
+    # ── Packet Length stats ───────────────────────────────────────────────────
+    pkt_len_variance = float(np.var(lengths))
+    pkt_len_max      = float(max(lengths))
+    pkt_len_min      = float(min(lengths))
 
+    # ── Init Fwd / Bwd Win Bytes ─────────────────────────────────────────────
+    # TCP window size of the very first packet in each direction
+    init_fwd_win = float(fwd_packets[0]["tcp_window"]) if fwd_packets else 0.0
+    init_bwd_win = float(bwd_packets[0]["tcp_window"]) if bwd_packets else 0.0
 
-    #FLOW PACKETS/S
-    flow_packets_per_s = len(packets) / flow_duration
-    
-    
-    #PACKET LENGTH MEAN
-    packet_length_mean = np.mean(lengths)
+    # ── Fwd Packets/s ─────────────────────────────────────────────────────────
+    fwd_packets_per_s = len(fwd_packets) / flow_duration
 
-    #INTERVAL BETWEEN PACKETS
-    iats = []
+    # ── Bwd Packet Length Mean ────────────────────────────────────────────────
+    bwd_lengths = [p["length"] for p in bwd_packets]
+    bwd_pkt_len_mean = float(np.mean(bwd_lengths)) if bwd_lengths else 0.0
 
-    for i in range(len(timestamps)-1):
-        iats.append( timestamps[i+1] - timestamps[i])
-
-    flow_iat_mean = np.mean(iats) if iats else 0
-    
-    #INTERVAL DEVIATION
-    flow_iat_std = np.std(iats) if iats else 0
-
-    #SYN, ACK AND RST COUNT
-    syn_count = sum(p["syn"] for p in packets)
-    ack_count = sum(p["ack"] for p in packets)
-    rst_count = sum(p["rst"] for p in packets)
-
-
-    
+    # ── Assemble feature vector (order must match model training) ─────────────
     features = np.array([
-        protocol,
-        flow_duration,
-        flow_bytes_per_s,
-        flow_packets_per_s,
-        packet_length_mean,
-        flow_iat_mean,
-        flow_iat_std,
-        syn_count,
-        ack_count,
-        rst_count
+        flow_duration,        # Flow Duration
+        flow_iat_mean,        # Flow IAT Mean
+        flow_iat_std,         # Flow IAT Std
+        pkt_len_variance,     # Packet Length Variance
+        pkt_len_max,          # Packet Length Max
+        init_fwd_win,         # Init Fwd Win Bytes
+        init_bwd_win,         # Init Bwd Win Bytes
+        fwd_packets_per_s,    # Fwd Packets/s
+        bwd_pkt_len_mean,     # Bwd Packet Length Mean
+        pkt_len_min,          # Packet Length Min
     ], dtype=np.float32)
 
-
-    #SOURCE IP, DESTINATION IP AND PROTOCOL
     meta = {
-        "src_ip": src_ip,
-        "dst_ip": dst_ip,
-        "protocol": protocol
+        "src_ip":   src_ip,
+        "dst_ip":   dst_ip,
+        "protocol": protocol,
     }
 
     return features, meta
 
 
-
+# ─── Public API ───────────────────────────────────────────────────────────────
 def extract_features():
+    """Drain and return all completed flows since last call."""
     with lock:
         ready = completed_flows[:]
         completed_flows.clear()
-    
     return ready
 
 
-def start_sniffing():
-    sniff(iface= INTERFACE, prn=process_packet, store=False)
+# ─── Capture loop ─────────────────────────────────────────────────────────────
+def _capture_loop():
+    cap = pcapy.open_live(INTERFACE, SNAPLEN, PROMISC, TIMEOUT_MS)
+    cap.setfilter(BPF_FILTER)
+    # dispatch(-1) loops forever; calls process_packet for each packet
+    cap.dispatch(-1, process_packet)
 
-sniff_thread = threading.Thread(target=start_sniffing, daemon=True)
-sniff_thread.start()
+
+def start_sniffing():
+    t = threading.Thread(target=_capture_loop, daemon=True)
+    t.start()
+    return t
